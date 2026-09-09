@@ -1,0 +1,13 @@
+# Python
+venv/
+__pycache__/
+*.py[cod]
+
+# Qdrant
+qdrant_storage/
+
+# Environment variables
+.env
+
+# IDE
+.vscode/
