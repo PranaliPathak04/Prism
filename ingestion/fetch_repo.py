@@ -1,5 +1,12 @@
 import requests
 import base64
+import os
+from dotenv import load_dotenv
+
+load_dotenv()  # reads .env file
+
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
+HEADERS = {"Authorization": f"token {GITHUB_TOKEN}"} if GITHUB_TOKEN else {}
 
 def get_repo_files(owner: str, repo: str, branch: str = "main"):
     """
@@ -8,7 +15,7 @@ def get_repo_files(owner: str, repo: str, branch: str = "main"):
     """
     # Step A: Get the full file tree (recursive)
     tree_url = f"https://api.github.com/repos/{owner}/{repo}/git/trees/{branch}?recursive=1"
-    resp = requests.get(tree_url)
+    resp = requests.get(tree_url , headers=HEADERS)
     resp.raise_for_status()
     tree = resp.json()["tree"]
 
@@ -20,9 +27,9 @@ def get_repo_files(owner: str, repo: str, branch: str = "main"):
 
     # Step C: Fetch content for each file (limit to first 5 for now, just to test)
     results = []
-    for item in code_files[:5]:
+    for item in code_files:
         blob_url = item["url"]
-        blob_resp = requests.get(blob_url)
+        blob_resp = requests.get(blob_url, headers=HEADERS)
         blob_resp.raise_for_status()
         blob_data = blob_resp.json()
         content = base64.b64decode(blob_data["content"]).decode("utf-8", errors="ignore")

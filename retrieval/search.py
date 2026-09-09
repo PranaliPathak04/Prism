@@ -26,7 +26,7 @@ def search_chunks(query: str, repo_name: str, top_k: int = 5):
 
 
 if __name__ == "__main__":
-    query = "how is the flask app created"
+    query = "what does the after_request decorator do"
     results = search_chunks(query, repo_name="pallets/flask")
 
     print(f"Query: {query}\n")
