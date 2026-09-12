@@ -48,13 +48,13 @@ def store_chunks(chunks: list[dict], repo_name: str):
 
 if __name__ == "__main__":
     from ingestion.fetch_repo import get_repo_files
-    from ingestion.chunker import chunk_text
+    from ingestion.ast_chunker import chunk_file
     from embeddings.embed import embed_chunks
 
     files = get_repo_files(owner="pallets", repo="flask", branch="main")
     all_chunks = []
     for f in files:
-        all_chunks.extend(chunk_text(f["content"], f["path"]))
+        all_chunks.extend(chunk_file(f["content"], f["path"]))
 
     embedded = embed_chunks(all_chunks)
 
