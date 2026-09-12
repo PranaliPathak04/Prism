@@ -47,10 +47,14 @@ def ask_question(question: str, chunks: list) -> str:
 
 if __name__ == "__main__":
     from retrieval.search import search_chunks
+    from retrieval.rerank import rerank
 
-    question = "how is the flask app created"
+    question = "what does the after_request decorator do"
     chunks = search_chunks(question, repo_name="pallets/flask")
-    answer = ask_question(question, chunks)
+    reranked_chunks = rerank(question, chunks, top_k=5)
+    top_chunks = [c for c, score in reranked_chunks]
+
+    answer = ask_question(question, top_chunks)
 
     print(f"Question: {question}\n")
     print(f"Answer:\n{answer}")
