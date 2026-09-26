@@ -51,32 +51,48 @@ def store_chunks(chunks: list[dict], repo_name: str):
     _client.upsert(collection_name=COLLECTION_NAME, points=points)
     print(f"Stored {len(points)} chunks in Qdrant.")
 
-
-if __name__ == "__main__":
+def index_repo(owner:str, repo:str, branch:str="main"):
+    """
+    Fetches a GitHub repo, chunks its files, embeds them, and stores them in Qdrant.
+    Full pipeline: fetch -> chunk -> embed -> store vectors -> extract & store call graph.
+    Returns a summary dict.
+    """
     from ingestion.fetch_repo import get_repo_files
     from ingestion.ast_chunker import chunk_file
     from embeddings.embed import embed_chunks
-    from graph.graph_store import init_db, clear_repo_edges,store_edges
+    from graph.graph_store import init_db, clear_repo_edges, store_edges
     from graph.call_extractor import extract_calls
 
-    REPO_NAME = "pallets/flask"
+    repo_name = f"{owner}/{repo}"
 
-    files = get_repo_files(owner="pallets", repo="flask", branch="main")
+    
+
+    files = get_repo_files(owner=owner, repo=repo, branch=branch)
     all_chunks = []
     all_edges = []
     for f in files:
         all_chunks.extend(chunk_file(f["content"], f["path"]))
         if f["path"].endswith(".py"):
-            edges = extract_calls(f["content"], f["path"])
-            all_edges.extend(edges)
+            all_edges.extend(extract_calls(f["content"], f["path"]))
+
 
     embedded = embed_chunks(all_chunks)
-
-    ensure_collection(force_recreate=True)
-    store_chunks(embedded, repo_name=REPO_NAME)
+    ensure_collection(force_recreate=False)  # dont wipe other repos in the same Qdrant instance
+    store_chunks(embedded, repo_name=repo_name)
 
     init_db()
-    clear_repo_edges(REPO_NAME)
-    store_edges(all_edges, repo_name=REPO_NAME)
+    clear_repo_edges(repo_name)
+    store_edges(all_edges, repo_name=repo_name)
 
-    print(f"Finished processing repo '{REPO_NAME}': {len(embedded)} chunks and {len(all_edges)} call edges stored.")
+    return {
+        "repo" : repo_name,
+        "files_processed" : len(files),
+        "chunks_stored" : len(embedded),
+        "call_edges_stored" : len(all_edges),
+    }
+
+if __name__ == "__main__":
+    results = index_repo("pallets", "flask", branch="main")
+    print(results)
+
+    

@@ -4,6 +4,7 @@ from pydantic import BaseModel
 from retrieval.hybrid_search import hybrid_search
 from graph.expand import expand_with_graph
 from generation.ask import ask_question
+from storage.qdrant_store import index_repo, ensure_collection
 
 app = FastAPI(title="Codebase RAG API")
 
@@ -12,10 +13,21 @@ class AskRequest(BaseModel):
     question: str
     repo: str  # e.g. "pallets/flask"
 
+class IndexRequest(BaseModel):
+    owner: str
+    repo: str
+    branch: str = "main"
+
 
 @app.get("/")
 def root():
     return {"status": "ok", "message": "Codebase RAG API is running"}
+
+@app.post("/index")
+def index(request: IndexRequest):
+    
+    result = index_repo(owner = request.owner, repo = request.repo, branch=request.branch)
+    return result
 
 
 @app.post("/ask")
