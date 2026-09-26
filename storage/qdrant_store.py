@@ -1,6 +1,8 @@
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, VectorParams, PointStruct
+
 import uuid
+import hashlib
+from qdrant_client.models import Distance ,Filter, FieldCondition, MatchValue , VectorParams, PointStruct
 
 COLLECTION_NAME = "code_chunks"
 VECTOR_SIZE = 384  # must match our embedding model's output size
@@ -27,6 +29,16 @@ def ensure_collection(force_recreate: bool = False):
         print(f"Collection '{COLLECTION_NAME}' already exists")
 
 
+def make_chunk_id(repo_name: str, chunk: dict) -> str:
+    """
+    Deterministic ID :same repo + path + line range -> same ID, so we don't store duplicates.
+    Re indxing unchanged files will overwrite the same points in Qdrant instead of creating duplicates.
+    """
+    raw = f"{repo_name}:{chunk['path']}:{chunk['start_line']}:{chunk['content']}"
+    hash_hex = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    return str(uuid.UUID(hash_hex[:32]))  # use first 32 hex chars to make a UUID
+
+
 def store_chunks(chunks: list[dict], repo_name: str):
     """
     Upload embedded chunks into Qdrant.
@@ -36,7 +48,7 @@ def store_chunks(chunks: list[dict], repo_name: str):
     for chunk in chunks:
         points.append(
             PointStruct(
-                id=str(uuid.uuid4()),  # unique ID per chunk
+                id=make_chunk_id(repo_name, chunk),  # unique ID per chunk
                 vector=chunk["embedding"],
                 payload={
                     "repo": repo_name,
@@ -50,6 +62,19 @@ def store_chunks(chunks: list[dict], repo_name: str):
 
     _client.upsert(collection_name=COLLECTION_NAME, points=points)
     print(f"Stored {len(points)} chunks in Qdrant.")
+
+def clear_repo_chunks(repo_name: str):
+    """
+    Delete all chunks in Qdrant for a given repo.
+    Useful if you want to re-index a repo from scratch.
+    """
+    _client.delete(
+        collection_name=COLLECTION_NAME,
+        points_selector=Filter(
+            must=[FieldCondition(key="repo", match=MatchValue(value=repo_name))]
+        )
+    )
+    print(f"Deleted all chunks for repo '{repo_name}' from Qdrant.")
 
 def index_repo(owner:str, repo:str, branch:str="main"):
     """
@@ -78,6 +103,7 @@ def index_repo(owner:str, repo:str, branch:str="main"):
 
     embedded = embed_chunks(all_chunks)
     ensure_collection(force_recreate=False)  # dont wipe other repos in the same Qdrant instance
+    clear_repo_chunks(repo_name=repo_name)  # remove old chunks for this repo
     store_chunks(embedded, repo_name=repo_name)
 
     init_db()
