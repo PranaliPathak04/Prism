@@ -28,6 +28,8 @@ def ensure_collection(force_recreate: bool = False):
     else:
         print(f"Collection '{COLLECTION_NAME}' already exists")
 
+    
+
 
 def make_chunk_id(repo_name: str, chunk: dict) -> str:
     """
@@ -76,6 +78,18 @@ def clear_repo_chunks(repo_name: str):
     )
     print(f"Deleted all chunks for repo '{repo_name}' from Qdrant.")
 
+def clear_repo_file_chunks(repo_name: str, path: str):
+    """Deletes chunks for one specific file within a repo (used for changed/deleted files)."""
+    _client.delete(
+        collection_name=COLLECTION_NAME,
+        points_selector=Filter(
+            must=[
+                FieldCondition(key="repo", match=MatchValue(value=repo_name)),
+                FieldCondition(key="path", match=MatchValue(value=path)),
+            ]
+        ),
+    )
+
 def index_repo(owner:str, repo:str, branch:str="main"):
     """
     Fetches a GitHub repo, chunks its files, embeds them, and stores them in Qdrant.
@@ -85,34 +99,79 @@ def index_repo(owner:str, repo:str, branch:str="main"):
     from ingestion.fetch_repo import get_repo_files
     from ingestion.ast_chunker import chunk_file
     from embeddings.embed import embed_chunks
-    from graph.graph_store import init_db, clear_repo_edges, store_edges
+    from graph.graph_store import (
+        init_db, store_edges,
+        init_file_hashes_table, get_stored_file_hashes, update_file_hashes,hash_content,
+        clear_file_edges, remove_file_hashes
+    )
     from graph.call_extractor import extract_calls
 
     repo_name = f"{owner}/{repo}"
 
-    
+    init_file_hashes_table()
+    init_db() # initialize the SQLite database for storing call graph edges
+    old_hashes = get_stored_file_hashes(repo_name) #what files have we already processed and stored hashes for
 
+    
     files = get_repo_files(owner=owner, repo=repo, branch=branch)
+
+    new_hashes = {}
+    changed_files = []
+    unchanged_count = 0
+
+    for f in files:
+        content_hash = hash_content(f["content"])
+        new_hashes[f["path"]] = content_hash
+
+        if old_hashes.get(f["path"]) == content_hash:
+            unchanged_count += 1
+            continue  # skip unchanged files
+
+        changed_files.append(f)
+    print(f"Found {len(changed_files)} changed/new files, {unchanged_count} unchanged files skipped.")
+
     all_chunks = []
     all_edges = []
-    for f in files:
+    for f in changed_files:
         all_chunks.extend(chunk_file(f["content"], f["path"]))
         if f["path"].endswith(".py"):
             all_edges.extend(extract_calls(f["content"], f["path"]))
 
 
-    embedded = embed_chunks(all_chunks)
-    ensure_collection(force_recreate=False)  # dont wipe other repos in the same Qdrant instance
-    clear_repo_chunks(repo_name=repo_name)  # remove old chunks for this repo
-    store_chunks(embedded, repo_name=repo_name)
+    embedded = embed_chunks(all_chunks) if all_chunks else []
 
-    init_db()
-    clear_repo_edges(repo_name)
+    ensure_collection(force_recreate=False)
+
+    #remove chunks for files that were deleted from repo
+    deleted_paths = set(old_hashes.keys()) - set(new_hashes.keys())
+
+    for path in deleted_paths:
+        clear_repo_file_chunks(repo_name,path)  # remove old chunks for this repo
+        clear_file_edges(repo_name,path)  # remove edges for this file
+
+    #remove old chunks for changed files and store new ones
+    for f in changed_files:
+        clear_repo_file_chunks(repo_name, f["path"])  # remove old chunks for this repo
+        clear_file_edges(repo_name, f["path"])  # remove edges for this file
+
+    if embedded:
+        store_chunks(embedded, repo_name=repo_name)
+
+    
+   
     store_edges(all_edges, repo_name=repo_name)
+
+    update_file_hashes(repo_name,list(new_hashes.items()))  # update stored hashes for all files in repo
+    remove_file_hashes(repo_name,deleted_paths)  # remove hashes for deleted files
+
 
     return {
         "repo" : repo_name,
-        "files_processed" : len(files),
+        "files_total" : len(files),
+        "files_changed" : len(changed_files),
+        "files_unchanged" : unchanged_count,
+        "files_deleted" : len(deleted_paths),
+
         "chunks_stored" : len(embedded),
         "call_edges_stored" : len(all_edges),
     }
