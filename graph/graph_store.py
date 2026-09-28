@@ -1,11 +1,13 @@
 import sqlite3
 import hashlib
 
+
 DB_PATH = "symbol_graph.db"
 
 
 def get_connection():
     conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA journal_mode=WAL")  # Enable WAL mode for better concurrency
     return conn
 
 
