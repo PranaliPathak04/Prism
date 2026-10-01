@@ -54,6 +54,7 @@ async def index_status(job_id: str):
     if status == JobStatus.complete:
         info = await job.result_info()
         resp["success"] = info.success
+        resp["status"] = "complete" if info.success else "failed"
         resp["result"] = info.result if info.success else str (info.result)
     return resp
 
