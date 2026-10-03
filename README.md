@@ -1,195 +1,138 @@
-# Prism — Codebase RAG
+# Prism
 
-Ask natural-language questions about any public GitHub repository and get accurate, source-cited answers grounded in the actual code.
+Chat with any GitHub repository. Point Prism at a repo, and it indexes the codebase so you can ask natural-language questions about it — answers are grounded in the actual source and cited by file and line.
 
-## What it does
+## How It Works
 
-Point Prism at a GitHub repo, and it builds a searchable understanding of the codebase — not just text search, but a system that understands function/class structure, call relationships between functions, and can answer questions like *"what does the `after_request` decorator do?"* with a real, traceable explanation citing exact files and line numbers.
+1. **Fetch** — pulls a repo's full file tree via the GitHub API
+2. **Chunk** — tree-sitter does AST-aware chunking, splitting code at function and class boundaries rather than arbitrary line counts, with a line-based fallback for unsupported file types
+3. **Embed** — each chunk gets a dense embedding (semantic similarity) and a sparse BM25 vector (exact keyword/identifier matches)
+4. **Store** — vectors go into Qdrant, tagged by repo; a call graph (caller → callee edges) is extracted and stored in SQLite
+5. **Retrieve** — a question triggers hybrid search (dense + sparse, fused via Reciprocal Rank Fusion), a cross-encoder reranks the top results for precision, then the call graph is expanded one hop to pull in related functions
+6. **Generate** — Groq (`openai/gpt-oss-120b`) answers strictly from the retrieved context, with file and line citations
 
-## How it works
+## Architecture
 
-```text
-GitHub URL
-    │
-    ▼
-Fetch files (GitHub API)
-    │
-    ▼
-AST-aware chunking (tree-sitter) ── splits code by function/class boundaries,
-    │                                not arbitrary line counts
-    ▼
-Dense embeddings (sentence-transformers) ──┐
-    │                                       ├─► Stored in Qdrant (vector DB)
-Sparse index (BM25, in-memory) ────────────┘
-    │
-Call graph extraction (tree-sitter) ──► Stored in SQLite
-    │
-    ▼
-[Query time]
-Hybrid search (dense + sparse, fused via RRF)
-    │
-    ▼
-Cross-encoder reranking ── re-scores top candidates for precision
-    │
-    ▼
-Graph expansion ── pulls in functions the top results call (1-hop)
-    │
-    ▼
-LLM generation (Groq) ── answers grounded strictly in retrieved code,
-    │                     with file + line citations
-    ▼
-FastAPI endpoint ── exposes it all as POST /ask
+![Prism architecture](./docs/architecture.png)
+
+## Idempotent Re-indexing
+
+Re-indexing a repo doesn't start from scratch or duplicate data:
+
+- Each file's content is hashed and compared against a stored hash (SQLite `file_hashes` table) — unchanged files are skipped entirely, only new or modified files are re-chunked and re-embedded
+- Chunk IDs are deterministic (derived from repo + path + line + content hash), so re-indexing unchanged code overwrites the same Qdrant point instead of creating a duplicate
+- Files deleted from the repo have their chunks and call-graph edges pruned automatically
+
+## Job Queue
+
+Indexing runs as a background job instead of blocking the request:
+
+- `POST /index` returns a `job_id` immediately; indexing runs asynchronously via an ARQ worker backed by Redis
+- `GET /index/{job_id}` polls for status (`queued` → `in_progress` → `complete`) and returns the indexing summary on success
+- A per-repo lock prevents two indexing jobs from running against the same repo at once
+- Failed jobs retry automatically with exponential backoff before being marked failed
+
+## Evaluation
+
+A DeepEval-based pipeline scores answer quality against a small set of test questions (currently targeting `pallets/flask`), using Groq as the LLM judge across four metrics: Faithfulness, Answer Relevancy, Contextual Precision, and Contextual Recall. Each result also checks whether the expected source chunk was actually retrieved.
+
+## Tech Stack
+
+| Layer | Technology |
+|---|---|
+| API Server | FastAPI |
+| Job Queue | ARQ + Redis |
+| Vector DB | Qdrant |
+| Dense Embeddings | `sentence-transformers` (`all-MiniLM-L6-v2`) |
+| Sparse Search | BM25 |
+| Re-ranking | Cross-encoder |
+| AST Parsing | tree-sitter |
+| LLM (generation + eval judge) | Groq (`openai/gpt-oss-120b`) |
+| Evaluation | DeepEval |
+| Call Graph Storage | SQLite |
+| Frontend | React + Vite + Tailwind CSS |
+
+## Project Structure
+
 ```
-
-## Tech stack
-
-| Layer | Technology | Why |
-|---|---|---|
-| Repo ingestion | GitHub REST API (Git Trees) | Fetch full file tree in one call |
-| Chunking | tree-sitter | Real AST parsing — chunks by function/class, not line count |
-| Dense embeddings | `sentence-transformers` (`all-MiniLM-L6-v2`) | Free, local, fast |
-| Sparse search | `rank-bm25` (in-memory) | Catches exact identifier/keyword matches embeddings miss |
-| Fusion | Reciprocal Rank Fusion (RRF) | Combines dense + sparse rankings without needing comparable score scales |
-| Reranking | Cross-encoder (`ms-marco-MiniLM-L-6-v2`) | Reads query + chunk together for precise relevance scoring |
-| Vector storage | Qdrant (Docker, local) | Native filtering for multi-tenant (multi-repo) search |
-| Call graph | tree-sitter + SQLite | Lightweight multi-hop reasoning (what calls/is called by what) |
-| Generation | Groq API (`openai/gpt-oss-120b`) | Free tier, fast inference |
-| API | FastAPI + Uvicorn | Async, auto-docs, industry standard |
-
-## Project structure
-
-```text
 Prism/
-├── ingestion/
-│   ├── fetch_repo.py       # Pulls files from GitHub API (auth via token)
-│   ├── chunker.py          # Naive line-based chunker (fallback for unsupported languages)
-│   └── ast_chunker.py      # tree-sitter AST-aware chunking (function/class boundaries)
-│
-├── embeddings/
-│   └── embed.py            # Dense embedding generation
-│
-├── storage/
-│   └── qdrant_store.py     # Qdrant collection management + chunk upsert; orchestrates full indexing
-│
-├── retrieval/
-│   ├── search.py           # Dense vector search
-│   ├── bm25_search.py      # Sparse keyword search (in-memory BM25 index)
-│   ├── hybrid_search.py    # RRF fusion of dense + sparse, then reranking
-│   └── rerank.py           # Cross-encoder reranking
-│
-├── graph/
-│   ├── call_extractor.py   # Extracts (caller, callee) pairs via tree-sitter
-│   ├── graph_store.py      # SQLite storage + traversal queries
-│   └── expand.py           # 1-hop expansion of retrieved chunks via the call graph
-│
-├── generation/
-│   └── ask.py              # Builds context from chunks, calls Groq, returns grounded answer
-│
-├── api/
-│   └── main.py             # FastAPI app: GET /, POST /ask
-│
-├── requirements.txt
-├── .env                    # API keys (not committed)
-├── .gitignore
-└── README.md
+├── api/              # FastAPI app and routes (/index, /index/{job_id}, /ask)
+├── ingestion/         # GitHub repo fetching
+├── embeddings/        # Dense + sparse embedding generation
+├── storage/           # Qdrant client, chunk storage, full indexing pipeline
+├── graph/              # tree-sitter call extraction, SQLite call-graph + file-hash storage
+├── retrieval/          # Hybrid search + reranking
+├── generation/         # Prompt building and Groq-based answer generation
+├── jobs/               # ARQ worker and background job definitions
+├── eval/               # DeepEval pipeline, Groq judge wrapper, test cases
+├── prism-ui/           # React + Vite + Tailwind frontend
+├── symbol_graph.db     # SQLite database (call graph + file hashes)
+└── requirements.txt
 ```
 
 ## Setup
 
-### Prerequisites
+### Backend
 
-- Python 3.12+
-- Docker (for running Qdrant locally)
-- A [GitHub personal access token](https://github.com/settings/tokens) (unscoped classic token is fine — raises API rate limit to 5,000/hour)
-- A [Groq API key](https://console.groq.com/) (free tier)
-
-### Installation
-
-```powershell
-git clone <this-repo>
+```bash
+git clone https://github.com/PranaliPathak04/Prism.git
 cd Prism
 python -m venv venv
-venv\Scripts\activate      # Windows
+venv\Scripts\activate          # Windows
 pip install -r requirements.txt
 ```
 
-### Environment variables
+Start Qdrant and Redis (each in its own Docker container):
 
-Create a `.env` file in the project root:
+```bash
+docker run -d -p 6333:6333 --name qdrant-prism qdrant/qdrant
+docker run -d -p 6379:6379 --name redis-prism redis
+```
+
+Create a `.env` file:
 
 ```env
-GITHUB_TOKEN=ghp_your_token_here
+GITHUB_TOKEN=ghp_your_token_here   # raises GitHub's API rate limit from 60/hr to 5,000/hr
 GROQ_API_KEY=gsk_your_key_here
 ```
 
-### Start Qdrant (vector database)
-
-```powershell
-docker run -p 6333:6333 -p 6334:6334 -v ${PWD}/qdrant_storage:/qdrant/storage qdrant/qdrant
-```
-
-Dashboard available at `http://localhost:6333/dashboard`.
-
-## Usage
-
-### Index a repository
-
-Currently run via script (API endpoint for this is planned — see Roadmap):
-
-```powershell
-python -m storage.qdrant_store
-```
-
-This fetches, chunks, embeds, and stores the repo (currently hardcoded to `pallets/flask` in the script — see Roadmap for making this dynamic via API).
-
-### Run the API
-
-```powershell
-uvicorn api.main:app --reload
-```
-
-Visit `http://127.0.0.1:8000/docs` for interactive API documentation.
-
-### Ask a question
+Run the API and the background worker in separate terminals:
 
 ```bash
-curl -X POST http://127.0.0.1:8000/ask \
-  -H "Content-Type: application/json" \
-  -d '{
-    "question": "what does the after_request decorator do",
-    "repo": "pallets/flask"
-  }'
+uvicorn api.main:app --reload
+arq jobs.worker.WorkerSettings
 ```
 
-Response:
+### Frontend
 
-```json
-{
-  "question": "...",
-  "answer": "...",
-  "sources": [
-    {"path": "src/flask/sansio/scaffold.py", "start_line": 495, "end_line": 513},
-    ...
-  ]
-}
+```bash
+cd prism-ui
+npm install
+npm run dev
 ```
 
-## Design decisions & lessons learned
+## API
 
-A few non-obvious choices made along the way, worth knowing if you extend this:
+| Method | Route | Description |
+|---|---|---|
+| `POST` | `/index` | Start indexing a repo (`owner`, `repo`, `branch`); returns a `job_id` |
+| `GET` | `/index/{job_id}` | Poll indexing job status and result |
+| `POST` | `/ask` | Ask a question about an indexed repo; returns an answer with source citations |
 
-- **Decorator unwrapping in chunking**: tree-sitter represents `@decorator def foo():` as a `decorated_definition` node wrapping a `function_definition`, not as a plain function node. Missing this silently drops most real-world Python methods (anything decorated) from chunking entirely.
+## Design Decisions & Lessons Learned
+
+A few non-obvious choices worth knowing if you extend this:
+
+- **Decorator unwrapping in chunking** — tree-sitter represents `@decorator def foo():` as a `decorated_definition` node wrapping a `function_definition`, not as a plain function node. Missing this silently drops most real-world Python methods (anything decorated) from chunking entirely.
 - **Class docstrings are truncated to one line** when prepended to method chunks — including the full docstring in every method's chunk diluted embeddings and wasted tokens.
-- **Hybrid search alone wasn't enough** — RRF fusion of dense+sparse still didn't reliably surface the correct chunk for narrow technical questions; the cross-encoder reranking step was what actually fixed precision.
-- **The call graph is approximate, not fully resolved** — it matches callee names as bare strings without full type resolution, so very generic method names (`get`, `set`) can produce false-positive graph edges across unrelated classes. Acceptable trade-off for the value it adds; a known limitation rather than a bug.
-- **Qdrant collections must be explicitly recreated on re-indexing** (`force_recreate=True`) — otherwise re-running the indexing script silently appends duplicate copies of every chunk rather than replacing them.
+- **Hybrid search alone wasn't enough** — RRF fusion of dense + sparse still didn't reliably surface the correct chunk for narrow technical questions; cross-encoder reranking was what actually fixed precision.
+- **The call graph is approximate, not fully resolved** — it matches callee names as bare strings without type resolution, so generic method names (`get`, `set`) can produce false-positive edges across unrelated classes. A known limitation, not a bug.
+- **Deterministic chunk IDs instead of `force_recreate`** — chunk IDs are derived from repo + path + line + content hash, so re-indexing unchanged code overwrites the same Qdrant point rather than requiring the whole collection to be wiped and rebuilt on every run.
 
-## Roadmap
+## Status
 
-- [ ] `POST /index` endpoint — index any repo on demand via API, not just via script
-- [ ] Background job queue for indexing (avoid blocking HTTP requests during long indexing runs)
-- [ ] Content-hash based incremental re-indexing (only re-embed changed files)
-- [ ] Extend tree-sitter chunking + call graph extraction to additional languages (currently Python-only for AST chunking and call extraction; other languages fall back to naive line-based chunking)
-- [ ] RAG evaluation pipeline (faithfulness, relevancy, precision/recall scoring)
-- [ ] Swap general-purpose embedding model for a code-specific one (e.g. Voyage code embeddings) if retrieval quality plateaus
-- [ ] Dockerize the full stack for one-command setup
+- ✅ Core pipeline (fetch → chunk → embed → retrieve → generate)
+- ✅ Idempotent, per-file incremental re-indexing
+- ✅ Background job queue with retries and status polling
+- 🔄 Evaluation pipeline built; currently rate-limited on Groq's free tier
+- 🔄 Frontend in progress
